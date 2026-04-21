@@ -1,0 +1,28 @@
+{
+  "name": "idle-tactical-rpg",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Base técnica inicial para un idle tactical turn-based RPG web-first con battle engine desacoplado de la UI.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "typescript",
+    "rpg",
+    "turn-based",
+    "battle-engine",
+    "web"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.8.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
