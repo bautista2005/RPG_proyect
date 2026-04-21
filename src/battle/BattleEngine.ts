@@ -1,9 +1,12 @@
+import type { BattleAction } from "./BattleAction.js";
 import type { CharacterDefinition } from "../domain/CharacterDefinition.js";
 import type { SkillDefinition, SkillTargetType } from "../domain/SkillDefinition.js";
 import type { ActiveStatusEffect, StatusEffectDefinition } from "../domain/StatusEffect.js";
 import { StatusEffectType } from "../domain/StatusEffect.js";
-import type { BattleState } from "./BattleState.js";
+import { getPassiveDefinition } from "../data/passives.js";
+import type { BattleLogEntry, BattleState } from "./BattleState.js";
 import { createEmptyBattleState } from "./BattleState.js";
+import { createBattleRandomState, deterministicTieBreak, rollRandom } from "./BattleRandom.js";
 import type { BattleUnit, BattleUnitSeed } from "./BattleUnit.js";
 import { createBattleUnit } from "./BattleUnit.js";
 
@@ -23,6 +26,12 @@ export interface InitializeBattleInput {
   battleId: string;
   teams: [BattleTeamDefinition, BattleTeamDefinition];
   skills?: SkillDefinition[];
+  seed?: number;
+}
+
+export interface BattleActionValidationResult {
+  isValid: boolean;
+  reason?: string;
 }
 
 export function initializeBattle(input: InitializeBattleInput): BattleState {
@@ -35,7 +44,8 @@ export function initializeBattle(input: InitializeBattleInput): BattleState {
   );
 
   const units = Object.fromEntries(seeds.map((seed) => [seed.unitId, createBattleUnit(seed)]));
-  const unitOrder = sortUnitIdsByTurnOrder(Object.values(units));
+  const random = createBattleRandomState(input.seed);
+  const unitOrder = sortUnitIdsByTurnOrder(Object.values(units), random.initialSeed);
   const currentUnitId = getNextActiveUnitId(unitOrder, units, null);
 
   const state: BattleState = {
@@ -44,6 +54,7 @@ export function initializeBattle(input: InitializeBattleInput): BattleState {
     turn: currentUnitId ? 1 : 0,
     currentUnitId,
     lifecycle: currentUnitId ? "in_progress" : "finished",
+    random,
     unitOrder,
     skills: Object.fromEntries((input.skills ?? []).map((skill) => [skill.id, skill])),
     units,
@@ -51,6 +62,7 @@ export function initializeBattle(input: InitializeBattleInput): BattleState {
       {
         turn: currentUnitId ? 1 : 0,
         message: `Battle initialized with ${unitOrder.length} units.`,
+        eventType: "battle_start",
       },
     ],
   };
@@ -90,7 +102,7 @@ export function executeSkill(
   skillId: string,
   targetUnitId: string,
 ): BattleState {
-  const validationError = validateAction(state, actorUnitId, targetUnitId);
+  const validationError = validateActionContext(state, actorUnitId, targetUnitId);
 
   if (validationError) {
     return appendLog(state, validationError, actorUnitId);
@@ -104,14 +116,31 @@ export function executeSkill(
     return appendLog(state, `${actor.name} cannot use skill ${skillId}.`, actorUnitId);
   }
 
+  const availabilityError = validateSkillAvailability(actor, skill);
+
+  if (availabilityError) {
+    return appendLog(state, availabilityError, actorUnitId);
+  }
+
   if (!isValidTarget(actor, target, skill.targetType)) {
     return appendLog(state, `${skill.name} cannot target ${target.name}.`, actorUnitId);
   }
 
-  let nextState = appendLog(state, `${actor.name} uses ${skill.name} on ${target.name}.`, actorUnitId);
+  let nextState = appendLog(state, `${actor.name} uses ${skill.name} on ${target.name}.`, actorUnitId, {
+    eventType: "action",
+    sourceUnitId: actorUnitId,
+    targetUnitId,
+    detail: skill.id,
+  });
+  nextState = spendEnergyAndSetCooldown(nextState, actorUnitId, skill);
 
   if ((skill.kind === "damage" || skill.kind === "apply_status") && skill.power) {
     nextState = applyDamage(nextState, actorUnitId, targetUnitId, skill.power, skill.name);
+    nextState = applySkillPressureDamage(nextState, actor, targetUnitId, skill);
+  }
+
+  if (skill.kind === "heal" && skill.power) {
+    nextState = applyHeal(nextState, actorUnitId, targetUnitId, skill.power, skill.name);
   }
 
   const winnerAfterDamage = checkVictoryCondition(nextState);
@@ -120,12 +149,12 @@ export function executeSkill(
     return finalizeBattle(nextState, winnerAfterDamage);
   }
 
-  if (skill.kind === "shield" && skill.shieldAmount) {
-    nextState = applyStatusEffect(nextState, actorUnitId, targetUnitId, {
-      type: StatusEffectType.Shield,
-      durationTurns: skill.statusEffect?.durationTurns ?? 2,
-      potency: skill.shieldAmount,
-    });
+  if (skill.kind === "shield") {
+    const shieldEffect = resolveShieldEffect(skill);
+
+    if (shieldEffect) {
+      nextState = applyStatusEffect(nextState, actorUnitId, targetUnitId, shieldEffect);
+    }
   } else if (skill.statusEffect) {
     nextState = applyStatusEffect(nextState, actorUnitId, targetUnitId, skill.statusEffect);
   }
@@ -137,6 +166,98 @@ export function executeSkill(
   }
 
   return advanceTurn(nextState);
+}
+
+export function validateAction(state: BattleState, action: BattleAction): BattleActionValidationResult {
+  const contextError = validateActionContext(state, action.actorId, action.targetId);
+
+  if (contextError) {
+    return {
+      isValid: false,
+      reason: contextError,
+    };
+  }
+
+  const actor = state.units[action.actorId];
+  const target = state.units[action.targetId];
+
+  if (action.actionType === "basic_attack") {
+    if (!isValidTarget(actor, target, "enemy")) {
+      return {
+        isValid: false,
+        reason: `Basic Attack cannot target ${target.name}.`,
+      };
+    }
+
+    return {
+      isValid: true,
+    };
+  }
+
+  if (!action.skillId) {
+    return {
+      isValid: false,
+      reason: "Skill action skipped because skillId is missing.",
+    };
+  }
+
+  const skill = state.skills[action.skillId];
+
+  if (!skill || !actor.skillIds.includes(action.skillId)) {
+    return {
+      isValid: false,
+      reason: `${actor.name} cannot use skill ${action.skillId}.`,
+    };
+  }
+
+  const availabilityError = validateSkillAvailability(actor, skill);
+
+  if (availabilityError) {
+    return {
+      isValid: false,
+      reason: availabilityError,
+    };
+  }
+
+  if (!isValidTarget(actor, target, skill.targetType)) {
+    return {
+      isValid: false,
+      reason: `${skill.name} cannot target ${target.name}.`,
+    };
+  }
+
+  return {
+    isValid: true,
+  };
+}
+
+export function executeAction(state: BattleState, action: BattleAction): BattleState {
+  const validation = validateAction(state, action);
+
+  if (!validation.isValid) {
+    const prefix = action.source === "manual" ? "Manual action rejected" : "Action rejected";
+    return addBattleLog(state, `${prefix}: ${validation.reason ?? "invalid action"}.`, action.actorId, {
+      eventType: "validation",
+      sourceUnitId: action.actorId,
+      targetUnitId: action.targetId,
+      detail: action.actionType,
+    });
+  }
+
+  const stateWithDecisionLog = action.decisionNote
+    ? addBattleLog(state, action.decisionNote, action.actorId, {
+        eventType: "decision",
+        sourceUnitId: action.actorId,
+        targetUnitId: action.targetId,
+        detail: action.actionType === "skill" ? action.skillId : action.actionType,
+      })
+    : state;
+
+  if (action.actionType === "skill" && action.skillId) {
+    return executeSkill(stateWithDecisionLog, action.actorId, action.skillId, action.targetId);
+  }
+
+  return executeBasicAttack(stateWithDecisionLog, action.actorId, action.targetId);
 }
 
 export function processTurnStartEffects(state: BattleState): BattleState {
@@ -163,6 +284,7 @@ export function processTurnStartEffects(state: BattleState): BattleState {
   );
 
   nextState = tickStatuses(nextState, unit.unitId);
+  nextState = tickCooldowns(nextState, unit.unitId);
 
   if (stunned) {
     nextState = appendLog(nextState, `${refreshedUnit.name} is stunned and skips the turn.`, refreshedUnit.unitId);
@@ -181,6 +303,7 @@ export function applyDamage(
   options?: {
     ignoreDefense?: boolean;
     logReasonAsEffect?: boolean;
+    disableVariance?: boolean;
   },
 ): BattleState {
   const target = state.units[targetUnitId];
@@ -189,11 +312,47 @@ export function applyDamage(
     return state;
   }
 
-  const totalDamage = calculateIncomingDamage(state, sourceUnitId, target, power, options);
-  const shieldResult = absorbShieldDamage(state, target, totalDamage);
-  const damageResult = resolveUnitDamage(target, shieldResult.statuses, shieldResult.remainingDamage);
+  let nextState = state;
+  const source = sourceUnitId ? state.units[sourceUnitId] : undefined;
+  const outgoingModifier = resolveOutgoingDamageModifier(source, target, options);
+  const totalDamage = calculateIncomingDamage(state, sourceUnitId, target, power + outgoingModifier, options);
+  const [stateAfterVariance, variedDamage] = applyDamageVariance(
+    nextState,
+    totalDamage,
+    (options?.disableVariance ?? false) || options?.ignoreDefense === true || options?.logReasonAsEffect === true,
+  );
+  nextState = stateAfterVariance;
+  const incomingReduction = resolveIncomingDamageReduction(target, variedDamage);
+  const finalDamage = Math.max(0, variedDamage - incomingReduction);
 
-  let nextState: BattleState = {
+  if (outgoingModifier > 0 && source) {
+    nextState = appendLog(
+      nextState,
+      `${source.name} passive ${getPassiveDefinition(source.passiveId)?.name ?? source.passiveId} adds ${outgoingModifier} damage against ${target.name}.`,
+      source.unitId,
+    );
+  }
+
+  if (incomingReduction > 0) {
+    nextState = appendLog(
+      nextState,
+      `${target.name} passive ${getPassiveDefinition(target.passiveId)?.name ?? target.passiveId} reduces incoming damage by ${incomingReduction}.`,
+      target.unitId,
+      {
+        eventType: "mitigation",
+        sourceUnitId: target.unitId,
+        targetUnitId: target.unitId,
+        value: incomingReduction,
+        detail: target.passiveId ?? "passive",
+      },
+    );
+  }
+
+  const shieldResult = absorbShieldDamage(nextState, target, finalDamage);
+  const damageResult = resolveUnitDamage(target, shieldResult.statuses, shieldResult.remainingDamage);
+  const actualDamage = Math.max(0, target.currentHp - damageResult.nextHp);
+
+  nextState = {
     ...shieldResult.state,
     units: {
       ...shieldResult.state.units,
@@ -212,10 +371,80 @@ export function applyDamage(
       nextState,
       `${target.name} takes ${shieldResult.remainingDamage} ${label}.`,
       target.unitId,
+      {
+        eventType: "damage",
+        sourceUnitId,
+        targetUnitId,
+        value: actualDamage,
+        detail: reason,
+      },
     );
   }
 
-  return logDefeatIfNeeded(nextState, sourceUnitId, target.name, damageResult.defeated);
+  nextState = logDefeatIfNeeded(nextState, sourceUnitId, target.unitId, target.name, damageResult.defeated);
+
+  if (damageResult.defeated && source) {
+    nextState = resolveOnKillPassive(nextState, source.unitId);
+  }
+
+  return nextState;
+}
+
+export function applyHeal(
+  state: BattleState,
+  sourceUnitId: string,
+  targetUnitId: string,
+  power: number,
+  reason: string,
+): BattleState {
+  const target = state.units[targetUnitId];
+
+  if (!target || target.isDefeated) {
+    return state;
+  }
+
+  const healedAmount = Math.max(0, Math.min(power, target.maxHp - target.currentHp));
+  const nextHp = Math.min(target.maxHp, target.currentHp + power);
+
+  let nextState = {
+    ...state,
+    units: {
+      ...state.units,
+      [target.unitId]: {
+        ...target,
+        currentHp: nextHp,
+      },
+    },
+  };
+
+  nextState = appendLog(
+    nextState,
+    `${target.name} recovers ${healedAmount} HP from ${reason}.`,
+    sourceUnitId,
+    {
+      eventType: "heal",
+      sourceUnitId,
+      targetUnitId,
+      value: healedAmount,
+      detail: reason,
+    },
+  );
+
+  if (healedAmount <= 0) {
+    nextState = appendLog(
+      nextState,
+      `${reason} had no effect on ${target.name}.`,
+      sourceUnitId,
+      {
+        eventType: "support_waste",
+        sourceUnitId,
+        targetUnitId,
+        detail: reason,
+      },
+    );
+  }
+
+  return nextState;
 }
 
 export function applyStatusEffect(
@@ -266,11 +495,44 @@ export function applyStatusEffect(
   };
 
   if (effect.type === StatusEffectType.Poison) {
-    nextState = appendLog(nextState, `${target.name} is poisoned for ${effect.durationTurns} turns.`, sourceUnitId);
+    nextState = appendLog(nextState, `${target.name} is poisoned for ${effect.durationTurns} turns.`, sourceUnitId, {
+      eventType: "status",
+      sourceUnitId,
+      targetUnitId,
+      detail: StatusEffectType.Poison,
+    });
   } else if (effect.type === StatusEffectType.Stun) {
-    nextState = appendLog(nextState, `${target.name} is stunned for ${effect.durationTurns} turns.`, sourceUnitId);
+    nextState = appendLog(nextState, `${target.name} is stunned for ${effect.durationTurns} turns.`, sourceUnitId, {
+      eventType: "status",
+      sourceUnitId,
+      targetUnitId,
+      detail: StatusEffectType.Stun,
+    });
   } else if (effect.type === StatusEffectType.Shield) {
-    nextState = appendLog(nextState, `${target.name} gains ${effect.potency ?? 0} shield.`, sourceUnitId);
+    nextState = appendLog(nextState, `${target.name} gains ${effect.potency ?? 0} shield.`, sourceUnitId, {
+      eventType: "status",
+      sourceUnitId,
+      targetUnitId,
+      value: effect.potency ?? 0,
+      detail: StatusEffectType.Shield,
+    });
+
+    const hadShield = existingIndex >= 0;
+    const isLowImpactShield = !hadShield && target.currentHp === target.maxHp;
+
+    if (hadShield || isLowImpactShield) {
+      nextState = appendLog(
+        nextState,
+        `${effect.type} on ${target.name} had limited immediate impact.`,
+        sourceUnitId,
+        {
+          eventType: "support_waste",
+          sourceUnitId,
+          targetUnitId,
+          detail: StatusEffectType.Shield,
+        },
+      );
+    }
   }
 
   return nextState;
@@ -318,11 +580,19 @@ export function advanceTurn(state: BattleState): BattleState {
   });
 }
 
-export function sortUnitIdsByTurnOrder(units: Array<{ unitId: string; speed: number }>): string[] {
+export function sortUnitIdsByTurnOrder(units: Array<{ unitId: string; speed: number }>, seed = 0): string[] {
   return [...units]
     .sort((left, right) => {
       if (right.speed !== left.speed) {
         return right.speed - left.speed;
+      }
+
+      const tieBreak =
+        deterministicTieBreak(seed, left.unitId, right.unitId) -
+        deterministicTieBreak(seed, right.unitId, left.unitId);
+
+      if (tieBreak !== 0) {
+        return tieBreak;
       }
 
       return left.unitId.localeCompare(right.unitId);
@@ -336,7 +606,7 @@ function executeDamageAction(
   targetUnitId: string,
   actionName: string,
 ): BattleState {
-  const validationError = validateAction(state, attackerUnitId, targetUnitId);
+  const validationError = validateActionContext(state, attackerUnitId, targetUnitId);
 
   if (validationError) {
     return appendLog(state, validationError, attackerUnitId);
@@ -349,8 +619,14 @@ function executeDamageAction(
     return appendLog(state, `${actionName} cannot target ${target.name}.`, attackerUnitId);
   }
 
-  let nextState = appendLog(state, `${attacker.name} uses ${actionName} on ${target.name}.`, attacker.unitId);
+  let nextState = appendLog(state, `${attacker.name} uses ${actionName} on ${target.name}.`, attacker.unitId, {
+    eventType: "action",
+    sourceUnitId: attacker.unitId,
+    targetUnitId: target.unitId,
+    detail: "basic_attack",
+  });
   nextState = applyDamage(nextState, attacker.unitId, target.unitId, 0, actionName);
+  nextState = gainEnergyFromBasicAttack(nextState, attacker.unitId);
 
   const winnerTeamId = checkVictoryCondition(nextState);
 
@@ -361,7 +637,7 @@ function executeDamageAction(
   return advanceTurn(nextState);
 }
 
-function validateAction(state: BattleState, actorUnitId: string, targetUnitId: string): string | null {
+function validateActionContext(state: BattleState, actorUnitId: string, targetUnitId: string): string | null {
   if (state.lifecycle !== "in_progress") {
     return "Action skipped because battle is not in progress.";
   }
@@ -384,6 +660,78 @@ function validateAction(state: BattleState, actorUnitId: string, targetUnitId: s
   return null;
 }
 
+function validateSkillAvailability(actor: BattleUnit, skill: SkillDefinition): string | null {
+  const currentCooldown = actor.cooldowns[skill.id] ?? 0;
+
+  if (currentCooldown > 0) {
+    return `${actor.name} cannot use ${skill.name} because it is on cooldown for ${currentCooldown} more turns.`;
+  }
+
+  const energyCost = skill.energyCost ?? 0;
+
+  if (actor.energy < energyCost) {
+    return `${actor.name} cannot use ${skill.name} because they need ${energyCost} energy.`;
+  }
+
+  return null;
+}
+
+function resolveShieldEffect(skill: SkillDefinition): StatusEffectDefinition | null {
+  if (skill.statusEffect?.type === StatusEffectType.Shield) {
+    return skill.statusEffect;
+  }
+
+  if (skill.shieldAmount) {
+    return {
+      type: StatusEffectType.Shield,
+      durationTurns: 2,
+      potency: skill.shieldAmount,
+    };
+  }
+
+  return null;
+}
+
+function applySkillPressureDamage(
+  state: BattleState,
+  actor: BattleUnit,
+  targetUnitId: string,
+  skill: SkillDefinition,
+): BattleState {
+  if (skill.id !== "tyrant-rush") {
+    return state;
+  }
+
+  const target = state.units[targetUnitId];
+
+  if (!target || target.isDefeated) {
+    return state;
+  }
+
+  let bonusDamage = 0;
+
+  if (target.role === "support" || target.role === "controller") {
+    bonusDamage += 3;
+  }
+
+  if (hasStatus(target, StatusEffectType.Shield)) {
+    bonusDamage += 2;
+  }
+
+  if (state.turn >= 8) {
+    bonusDamage += 2;
+  }
+
+  if (bonusDamage <= 0) {
+    return state;
+  }
+
+  return applyDamage(state, actor.unitId, target.unitId, bonusDamage, `${skill.name} pressure`, {
+    ignoreDefense: true,
+    disableVariance: true,
+  });
+}
+
 function processPoisonEffects(state: BattleState, unit: BattleUnit): BattleState {
   let nextState = state;
   const poisonEffects = unit.statuses.filter(
@@ -394,6 +742,7 @@ function processPoisonEffects(state: BattleState, unit: BattleUnit): BattleState
     nextState = applyDamage(nextState, effect.sourceUnitId, unit.unitId, effect.potency ?? 0, "poison damage", {
       ignoreDefense: true,
       logReasonAsEffect: true,
+      disableVariance: true,
     });
 
     const winnerTeamId = checkVictoryCondition(nextState);
@@ -437,6 +786,48 @@ function calculateIncomingDamage(
   return Math.max(1, (source?.attack ?? 0) + power - target.defense);
 }
 
+function applyDamageVariance(
+  state: BattleState,
+  damage: number,
+  disabled: boolean,
+): [BattleState, number] {
+  if (disabled || damage <= 1) {
+    return [state, damage];
+  }
+
+  const [nextState, roll] = rollRandom(state);
+  const modifier = roll < 1 / 3 ? -1 : roll < 2 / 3 ? 0 : 1;
+
+  return [nextState, Math.max(1, damage + modifier)];
+}
+
+function resolveOutgoingDamageModifier(
+  source: BattleUnit | undefined,
+  target: BattleUnit,
+  options?: {
+    ignoreDefense?: boolean;
+    logReasonAsEffect?: boolean;
+  },
+): number {
+  if (!source || options?.logReasonAsEffect) {
+    return 0;
+  }
+
+  if (source.passiveId === "bonus_damage_vs_poisoned" && hasStatus(target, StatusEffectType.Poison)) {
+    return 2;
+  }
+
+  return 0;
+}
+
+function resolveIncomingDamageReduction(target: BattleUnit, totalDamage: number): number {
+  if (target.passiveId !== "reduce_incoming_damage_flat" || totalDamage <= 0) {
+    return 0;
+  }
+
+  return Math.min(1, Math.max(0, totalDamage - 1));
+}
+
 function absorbShieldDamage(
   state: BattleState,
   target: BattleUnit,
@@ -470,7 +861,13 @@ function absorbShieldDamage(
     ...shield,
     potency: (shield.potency ?? 0) - absorbed,
   };
-  nextState = appendLog(nextState, `${target.name}'s shield absorbed ${absorbed} damage.`, target.unitId);
+  nextState = appendLog(nextState, `${target.name}'s shield absorbed ${absorbed} damage.`, target.unitId, {
+    eventType: "mitigation",
+    sourceUnitId: shield.sourceUnitId ?? target.unitId,
+    targetUnitId: target.unitId,
+    value: absorbed,
+    detail: StatusEffectType.Shield,
+  });
 
   if ((nextStatuses[shieldIndex].potency ?? 0) <= 0) {
     nextStatuses = nextStatuses.filter((_, index) => index !== shieldIndex);
@@ -505,6 +902,7 @@ function resolveUnitDamage(
 function logDefeatIfNeeded(
   state: BattleState,
   sourceUnitId: string | undefined,
+  targetUnitId: string,
   targetName: string,
   defeated: boolean,
 ): BattleState {
@@ -512,7 +910,11 @@ function logDefeatIfNeeded(
     return state;
   }
 
-  return appendLog(state, `${targetName} was defeated.`, sourceUnitId);
+  return appendLog(state, `${targetName} was defeated.`, sourceUnitId, {
+    eventType: "defeat",
+    sourceUnitId,
+    targetUnitId,
+  });
 }
 
 function tickStatuses(state: BattleState, unitId: string): BattleState {
@@ -545,6 +947,155 @@ function tickStatuses(state: BattleState, unitId: string): BattleState {
       },
     },
   };
+}
+
+function tickCooldowns(state: BattleState, unitId: string): BattleState {
+  const unit = state.units[unitId];
+
+  if (!unit) {
+    return state;
+  }
+
+  const nextCooldowns = Object.fromEntries(
+    Object.entries(unit.cooldowns)
+      .map(([skillId, turns]) => [skillId, turns - 1] as const)
+      .filter(([, turns]) => turns > 0),
+  );
+
+  return {
+    ...state,
+    units: {
+      ...state.units,
+      [unitId]: {
+        ...unit,
+        cooldowns: nextCooldowns,
+      },
+    },
+  };
+}
+
+function spendEnergyAndSetCooldown(
+  state: BattleState,
+  actorUnitId: string,
+  skill: SkillDefinition,
+): BattleState {
+  const actor = state.units[actorUnitId];
+
+  if (!actor) {
+    return state;
+  }
+
+  const energyCost = skill.energyCost ?? 0;
+  const cooldownTurns = skill.cooldownTurns ?? 0;
+
+  return {
+    ...state,
+    units: {
+      ...state.units,
+      [actorUnitId]: {
+        ...actor,
+        energy: actor.energy - energyCost,
+        cooldowns:
+          cooldownTurns > 0
+            ? {
+                ...actor.cooldowns,
+                [skill.id]: cooldownTurns,
+              }
+            : actor.cooldowns,
+      },
+    },
+  };
+}
+
+function gainEnergy(state: BattleState, unitId: string, amount: number): BattleState {
+  if (amount <= 0) {
+    return state;
+  }
+
+  const unit = state.units[unitId];
+
+  if (!unit) {
+    return state;
+  }
+
+  return {
+    ...state,
+    units: {
+      ...state.units,
+      [unitId]: {
+        ...unit,
+        energy: unit.energy + amount,
+      },
+    },
+  };
+}
+
+function gainEnergyFromBasicAttack(state: BattleState, unitId: string): BattleState {
+  const unit = state.units[unitId];
+
+  if (!unit) {
+    return state;
+  }
+
+  const amount = unit.passiveId === "gain_extra_energy_on_basic" ? 2 : 1;
+  const nextState = gainEnergy(state, unitId, amount);
+
+  if (amount > 1) {
+    return appendLog(
+      nextState,
+      `${unit.name} passive ${getPassiveDefinition(unit.passiveId)?.name ?? unit.passiveId} grants +1 extra energy on Basic Attack.`,
+      unit.unitId,
+      {
+        eventType: "passive",
+        sourceUnitId: unit.unitId,
+        value: amount - 1,
+        detail: unit.passiveId,
+      },
+    );
+  }
+
+  return nextState;
+}
+
+function resolveOnKillPassive(state: BattleState, unitId: string): BattleState {
+  const unit = state.units[unitId];
+
+  if (!unit || unit.passiveId !== "heal_small_on_kill" || unit.isDefeated) {
+    return state;
+  }
+
+  const healAmount = Math.min(3, unit.maxHp - unit.currentHp);
+
+  if (healAmount <= 0) {
+    return state;
+  }
+
+  const nextState: BattleState = {
+    ...state,
+    units: {
+      ...state.units,
+      [unitId]: {
+        ...unit,
+        currentHp: unit.currentHp + healAmount,
+      },
+    },
+  };
+
+  return appendLog(
+    nextState,
+    `${unit.name} passive ${getPassiveDefinition(unit.passiveId)?.name ?? unit.passiveId} restores ${healAmount} HP on kill.`,
+    unit.unitId,
+    {
+      eventType: "passive",
+      sourceUnitId: unit.unitId,
+      value: healAmount,
+      detail: unit.passiveId,
+    },
+  );
+}
+
+function hasStatus(unit: BattleUnit, effectType: StatusEffectType): boolean {
+  return unit.statuses.some((status) => status.type === effectType && status.remainingTurns > 0);
 }
 
 function getNextActiveUnitId(
@@ -600,12 +1151,18 @@ function finalizeBattle(state: BattleState, winnerTeamId: string): BattleState {
       {
         turn: state.turn,
         message: `Team ${winnerTeamId} wins the battle.`,
+        eventType: "battle_end",
       },
     ],
   };
 }
 
-function appendLog(state: BattleState, message: string, actorUnitId?: string): BattleState {
+function appendLog(
+  state: BattleState,
+  message: string,
+  actorUnitId?: string,
+  metadata?: Partial<BattleLogEntry>,
+): BattleState {
   return {
     ...state,
     logs: [
@@ -614,7 +1171,17 @@ function appendLog(state: BattleState, message: string, actorUnitId?: string): B
         turn: state.turn,
         actorUnitId,
         message,
+        ...metadata,
       },
     ],
   };
+}
+
+export function addBattleLog(
+  state: BattleState,
+  message: string,
+  actorUnitId?: string,
+  metadata?: Partial<BattleLogEntry>,
+): BattleState {
+  return appendLog(state, message, actorUnitId, metadata);
 }

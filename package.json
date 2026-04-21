@@ -4,11 +4,12 @@
   "private": true,
   "description": "Base técnica inicial para un idle tactical turn-based RPG web-first con battle engine desacoplado de la UI.",
   "type": "module",
-  "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
-  },
+"scripts": {
+  "dev": "tsx watch src/index.ts",
+  "start": "tsx src/index.ts",
+  "build": "tsc -p tsconfig.json",
+  "test": "vitest run"
+},
   "keywords": [
     "typescript",
     "rpg",

@@ -1,4 +1,6 @@
-import type { CharacterDefinition, CharacterStats } from "../domain/CharacterDefinition.js";
+import type { CharacterAiProfile, CharacterDefinition, CharacterStats } from "../domain/CharacterDefinition.js";
+import type { CharacterTrait } from "../domain/CharacterTrait.js";
+import type { PassiveId } from "../domain/PassiveDefinition.js";
 import type { ActiveStatusEffect } from "../domain/StatusEffect.js";
 
 /**
@@ -10,6 +12,10 @@ export interface BattleUnit {
   teamId: string;
   characterId: string;
   name: string;
+  role?: string;
+  aiProfile: CharacterAiProfile;
+  trait?: CharacterTrait;
+  passiveId?: PassiveId;
   skillIds: string[];
   currentHp: number;
   maxHp: number;
@@ -40,6 +46,10 @@ export function createBattleUnit(seed: BattleUnitSeed): BattleUnit {
     teamId: seed.teamId,
     characterId: seed.character.id,
     name: seed.character.name,
+    role: seed.character.role,
+    aiProfile: seed.character.aiProfile ?? "aggressive",
+    trait: seed.character.trait,
+    passiveId: seed.character.passiveId,
     skillIds: seed.character.skillIds,
     currentHp: stats.hp,
     maxHp: stats.hp,
